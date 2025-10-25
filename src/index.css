@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-hud-dark text-hud-text-primary font-mono;
+  
+  /* Subtle grid background for a technical feel */
+  background-image: 
+    linear-gradient(rgba(48, 54, 61, 0.5) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(48, 54, 61, 0.5) 1px, transparent 1px);
+  background-size: 2rem 2rem;
+}
+body {
+  @apply bg-gray-900 text-gray-100; /* Example */
+}
