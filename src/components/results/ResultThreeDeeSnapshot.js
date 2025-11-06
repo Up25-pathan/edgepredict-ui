@@ -1,102 +1,107 @@
-import React, { Suspense, useMemo } from 'react';
-import { Canvas } from '@react-three/fiber';
-import { OrbitControls } from '@react-three/drei';
+import React, { useMemo, useEffect, useRef } from 'react';
+import { Canvas, useThree } from '@react-three/fiber';
+import { OrbitControls, PerspectiveCamera } from '@react-three/drei';
 import * as THREE from 'three';
 
-// This component builds the 3D model from the node data
-const ToolPointCloud = ({ nodeData }) => {
-  const geometry = useMemo(() => {
-    if (!nodeData || nodeData.length === 0) {
-      return null;
-    }
-
-    const positions = [];
-    const colors = [];
-    const color = new THREE.Color();
-    
-    // Find min/max stress to create a color gradient
-    let minStress = Infinity;
-    let maxStress = -Infinity;
-    nodeData.forEach(node => {
-      if (node.stress != null) {
-        if (node.stress < minStress) minStress = node.stress;
-        if (node.stress > maxStress) maxStress = node.stress;
-      }
-    });
-
-    if (minStress === maxStress) minStress = maxStress - 1; // Avoid divide-by-zero
-
-    // Create the geometry from the node data
-    nodeData.forEach(node => {
-      // 1. Add vertex position
-      if (node.pos && node.pos.length === 3) {
-        // --- THIS WAS THE TYPO FIX ('s2' -> '2') ---
-        positions.push(node.pos[0], node.pos[1], node.pos[2]);
-      } else {
-        return; // Skip node if data is bad
-      }
-
-      // 2. Add vertex color based on stress
-      const stress = node.stress || 0;
-      const normalizedStress = (stress - minStress) / (maxStress - minStress);
-      
-      // Gradient from blue (low stress, 0.7 HSL) to red (high stress, 0.0 HSL)
-      color.setHSL(0.7 * (1 - normalizedStress), 1.0, 0.5); 
-      
-      colors.push(color.r, color.g, color.b);
-    });
-
-    if (positions.length === 0) return null;
-
-    // Create the BufferGeometry
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    geo.computeBoundingSphere(); // Center the geometry
-    
-    return geo;
-
-  }, [nodeData]);
-
-  if (!geometry) {
-    return null; // Don't render if no data
-  }
-
-  // Render the geometry as a point cloud
-  return (
-    <points geometry={geometry}>
-      <pointsMaterial 
-        vertexColors 
-        size={2} // Point size in pixels
-        sizeAttenuation={false} // Make size constant regardless of zoom
-      />
-    </points>
-  );
+const CameraAutoFit = ({ bounds }) => {
+    const { camera, controls } = useThree();
+    const mounted = useRef(false);
+    useEffect(() => {
+        if (bounds && !bounds.isEmpty() && controls && !mounted.current) {
+            mounted.current = true;
+            const center = new THREE.Vector3();
+            bounds.getCenter(center);
+            const size = new THREE.Vector3();
+            bounds.getSize(size);
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * (Math.PI / 180);
+            let cameraZ = Math.abs(maxDim / 2 * Math.tan(fov * 2)) * 1.5;
+            cameraZ = Math.max(cameraZ, 0.1);
+            camera.position.set(center.x, center.y + maxDim * 0.5, center.z + cameraZ);
+            camera.lookAt(center);
+            controls.target.copy(center);
+            controls.update();
+        }
+    }, [bounds, camera, controls]);
+    return null;
 };
 
+const ResultThreeDeeSnapshot = ({ nodeData, particleData }) => {
+    const { toolPositions, toolColors, partPositions, partColors, bounds } = useMemo(() => {
+        const bbox = new THREE.Box3();
+        const colorHelper = new THREE.Color();
+        let tPos = new Float32Array(0), tCol = new Float32Array(0);
+        if (nodeData && nodeData.length > 0) {
+            tPos = new Float32Array(nodeData.length * 3);
+            tCol = new Float32Array(nodeData.length * 3);
+            let maxStress = 0;
+            for (let i = 0; i < nodeData.length; i++) maxStress = Math.max(maxStress, nodeData[i].stress_MPa);
+            maxStress = Math.max(maxStress, 1.0);
+            for (let i = 0; i < nodeData.length; i++) {
+                const node = nodeData[i];
+                const idx = i * 3;
+                const x = node.position[0] !== undefined ? node.position[0] : node.position.x;
+                const y = node.position[1] !== undefined ? node.position[1] : node.position.y;
+                const z = node.position[2] !== undefined ? node.position[2] : node.position.z;
+                tPos[idx] = x; tPos[idx+1] = y; tPos[idx+2] = z;
+                bbox.expandByPoint(new THREE.Vector3(x, y, z));
+                const t = Math.min(1.0, Math.max(0.0, node.stress_MPa / maxStress));
+                colorHelper.setHSL(0.66 - (t * 0.66), 1.0, 0.5);
+                tCol[idx] = colorHelper.r; tCol[idx+1] = colorHelper.g; tCol[idx+2] = colorHelper.b;
+            }
+        }
+        let pPos = new Float32Array(0), pCol = new Float32Array(0);
+        if (particleData && particleData.length > 0) {
+            pPos = new Float32Array(particleData.length * 3);
+            pCol = new Float32Array(particleData.length * 3);
+            for (let i = 0; i < particleData.length; i++) {
+                const p = particleData[i];
+                const idx = i * 3;
+                pPos[idx] = p.position[0]; pPos[idx+1] = p.position[1]; pPos[idx+2] = p.position[2];
+                bbox.expandByPoint(new THREE.Vector3(p.position[0], p.position[1], p.position[2]));
+                const t = Math.min(1.0, p.temperature / 1500.0); 
+                colorHelper.setHSL(0.1 - (t * 0.1), 1.0, 0.5 + t * 0.5);
+                pCol[idx] = colorHelper.r; pCol[idx+1] = colorHelper.g; pCol[idx+2] = colorHelper.b;
+            }
+        }
+        return { toolPositions: tPos, toolColors: tCol, partPositions: pPos, partColors: pCol, bounds: bbox };
+    }, [nodeData, particleData]);
 
-// --- This is the main component ---
-const ResultThreeDeeSnapshot = ({ nodeData }) => {
-  return (
-    // --- FIX: Set position MUCH closer to the origin [0,0,0] & bright background ---
-    <Canvas camera={{ position: [0.02, 0.02, 0.02], fov: 50 }}>
-      {/* --- FIX: Added bright background --- */}
-      <color attach="background" args={['#ffffff']} />
-      <Suspense fallback={null}>
-        <ambientLight intensity={1.0} />
-        <directionalLight position={[10, 10, 5]} />
-        
-        {/* We rotate the model to be "Y-up" like a tool */}
-        <group rotation={[-Math.PI / 2, 0, 0]}> 
-            <ToolPointCloud nodeData={nodeData} />
-        </group>
+    if ((!nodeData || nodeData.length === 0) && (!particleData || particleData.length === 0)) return null;
 
-        <OrbitControls makeDefault />
-        <gridHelper args={[0.1, 10]} /> {/* --- FIX: Added grid --- */}
-        <axesHelper args={[0.05]} /> {/* Show X,Y,Z axes */}
-      </Suspense>
-    </Canvas>
-  );
+    return (
+        <Canvas className="h-full w-full min-h-[500px]">
+            <ambientLight intensity={0.6} />
+            <pointLight position={[10, 10, 10]} intensity={0.8} />
+            <PerspectiveCamera makeDefault position={[0, 0, 10]} fov={50} near={0.0001} far={1000} />
+            <OrbitControls makeDefault />
+            <CameraAutoFit bounds={bounds} />
+            <axesHelper args={[0.01]} />
+            {toolPositions.length > 0 && (
+                <points>
+                    <bufferGeometry>
+                        <bufferAttribute attach="attributes-position" count={toolPositions.length / 3} array={toolPositions} itemSize={3} />
+                        <bufferAttribute attach="attributes-color" count={toolColors.length / 3} array={toolColors} itemSize={3} />
+                    </bufferGeometry>
+                    <pointsMaterial size={0.0005} vertexColors sizeAttenuation={true} transparent={true} opacity={0.3} />
+                </points>
+            )}
+            {partPositions.length > 0 && (
+                <points>
+                    <bufferGeometry>
+                        <bufferAttribute attach="attributes-position" count={partPositions.length / 3} array={partPositions} itemSize={3} />
+                        <bufferAttribute attach="attributes-color" count={partColors.length / 3} array={partColors} itemSize={3} />
+                    </bufferGeometry>
+                    <pointsMaterial
+                     size={0.0008}           // Slightly larger than 0.0005
+                     vertexColors
+                     sizeAttenuation={true}
+                     transparent={true}
+                     opacity={0.6}           // More opaque (was 0.3)
+                    />
+                </points>
+            )}
+        </Canvas>
+    );
 };
-
 export default ResultThreeDeeSnapshot;
