@@ -1,12 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import api from '../services/api'; 
-import { useAuth } from '../context/AuthContext'; 
+import api from '../services/api';
+import { useAuth } from '../context/AuthContext';
 
 // --- (Import components) ---
-import AnalysisReport from '../components/results/AnalysisReport'; 
-import MetricCard from '../components/results/MetricCard'; 
-import ResultThreeDeeSnapshot from '../components/results/ResultThreeDeeSnapshot'; 
+import AnalysisReport from '../components/results/AnalysisReport';
+import MetricCard from '../components/results/MetricCard';
+import ResultThreeDeeSnapshot from '../components/results/ResultThreeDeeSnapshot';
 
 // --- (jsPDF imports) ---
 import jsPDF from 'jspdf';
@@ -17,309 +17,403 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsi
 
 const SimulationResultsPage = () => {
     const { id } = useParams();
-    const { user } = useAuth(); 
+    const { user } = useAuth();
     const [simulation, setSimulation] = useState(null);
     const [parsedResults, setParsedResults] = useState(null);
     const [error, setError] = useState(null);
     const [isLoading, setIsLoading] = useState(true);
+    const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
+
+    // Use a ref to track mounted state for safe async state updates
+    const isMounted = useRef(true);
+    // Use a ref for the polling timer so we can clear it easily
+    const pollTimer = useRef(null);
 
     useEffect(() => {
-        const fetchSimulation = async () => { 
-            try {
-                const response = await api.getSimulationById(id);
-                const sim = response.data;
-                setSimulation(sim);
-
-                if (sim.status === 'COMPLETED' || sim.status === 'FAILED') {
-                    setIsLoading(false);
-                    
-                    if (sim.results) {
-                        try {
-                            const results = JSON.parse(sim.results);
-                            setParsedResults(results);
-                            
-                            if (!results || (results.error && sim.status === 'COMPLETED')) {
-                                setError(`Simulation completed but results are invalid: ${results.error || 'Unknown error.'}`);
-                            }
-                        } catch (e) {
-                            console.error("Failed to parse simulation results:", e);
-                            setError(`Simulation finished, but results are not valid JSON: ${sim.results}`);
-                        }
-                    } else if (sim.status === 'COMPLETED') {
-                         setError("Simulation completed, but no results were saved.");
-                    }
-
-                } else if (sim.status === 'PENDING' || sim.status === 'RUNNING') {
-                    setTimeout(fetchSimulation, 5000); // Poll every 5 seconds
-                }
-
-            } catch (err) {
-                console.error("Error fetching simulation:", err);
-                setError("Failed to fetch simulation data. You may not have permission.");
-                setIsLoading(false);
-            }
+        isMounted.current = true;
+        return () => {
+            isMounted.current = false;
+            if (pollTimer.current) clearTimeout(pollTimer.current);
         };
+    }, []);
 
+    const fetchSimulation = useCallback(async () => {
+        try {
+            const response = await api.getSimulationById(id);
+            if (!isMounted.current) return;
+
+            const sim = response.data;
+            setSimulation(sim);
+
+            if (sim.status === 'COMPLETED' || sim.status === 'FAILED') {
+                setIsLoading(false);
+
+                if (sim.results) {
+                    try {
+                        // Only parse if we haven't already to save re-renders
+                        const results = typeof sim.results === 'string' ? JSON.parse(sim.results) : sim.results;
+                        setParsedResults(results);
+
+                        if (sim.status === 'COMPLETED' && (!results || results.error)) {
+                            setError(`Simulation reported complete, but results indicate failure: ${results?.error || 'Unknown error'}`);
+                        }
+                    } catch (e) {
+                        console.error("Failed to parse simulation results:", e);
+                        setError("Failed to parse simulation results data.");
+                    }
+                } else if (sim.status === 'COMPLETED') {
+                    setError("Simulation marked as complete, but no results data was found.");
+                }
+            } else {
+                // Still running, poll again in 3 seconds
+                pollTimer.current = setTimeout(fetchSimulation, 3000);
+            }
+
+        } catch (err) {
+            if (!isMounted.current) return;
+            console.error("Error fetching simulation:", err);
+            setError(err.response?.data?.detail || "Failed to fetch simulation status.");
+            setIsLoading(false);
+        }
+    }, [id]);
+
+    // Initial fetch on mount
+    useEffect(() => {
         if (user) {
+            setIsLoading(true);
             fetchSimulation();
         }
-    }, [id, user]); 
+    }, [fetchSimulation, user]);
+
 
     // --- (Handle PDF Download) ---
-    const handleDownloadPdf = () => {
+    const handleDownloadPdf = async () => {
         const reportElement = document.getElementById('report-content');
         if (!reportElement) return;
-        setIsLoading(true); 
-        html2canvas(reportElement, { useCORS: true, allowTaint: true })
-            .then((canvas) => {
-                const imgData = canvas.toDataURL('image/png');
-                const pdf = new jsPDF('p', 'mm', 'a4');
-                const pdfWidth = pdf.internal.pageSize.getWidth();
-                const pdfHeight = pdf.internal.pageSize.getHeight();
-                const canvasWidth = canvas.width;
-                const canvasHeight = canvas.height;
-                const ratio = canvasHeight / canvasWidth;
-                const imgHeight = pdfWidth * ratio;
-                let heightLeft = imgHeight;
-                let position = 0;
+
+        try {
+            setIsGeneratingPdf(true);
+            const canvas = await html2canvas(reportElement, {
+                useCORS: true,
+                allowTaint: true,
+                scale: 2 // Higher resolution
+            });
+
+            const imgData = canvas.toDataURL('image/png');
+            const pdf = new jsPDF('p', 'mm', 'a4');
+            const pdfWidth = pdf.internal.pageSize.getWidth();
+            const pdfHeight = pdf.internal.pageSize.getHeight();
+            const imgHeight = (canvas.height * pdfWidth) / canvas.width;
+
+            let heightLeft = imgHeight;
+            let position = 0;
+
+            pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeight);
+            heightLeft -= pdfHeight;
+
+            while (heightLeft > 0) {
+                position = heightLeft - imgHeight;
+                pdf.addPage();
                 pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeight);
                 heightLeft -= pdfHeight;
-                while (heightLeft > 0) {
-                    position = heightLeft - imgHeight;
-                    pdf.addPage();
-                    pdf.addImage(imgData, 'PNG', 0, position, pdfWidth, imgHeight);
-                    heightLeft -= pdfHeight;
-                }
-                pdf.save(`EdgePredict_Simulation_${id}.pdf`);
-                setIsLoading(false);
-            })
-            .catch(err => {
-                console.error("Error generating PDF:", err);
-                setError("Could not generate PDF report.");
-                setIsLoading(false);
-            });
+            }
+
+            pdf.save(`EdgePredict_Report_${simulation?.name.replace(/\s+/g, '_') || id}.pdf`);
+
+        } catch (err) {
+            console.error("Error generating PDF:", err);
+            alert("Could not generate PDF. Please try again.");
+        } finally {
+            if (isMounted.current) setIsGeneratingPdf(false);
+        }
     };
 
-    // --- (Handle Loading & Error States) ---
-    if (isLoading && !simulation) {
-        return <div className="text-center text-gray-300 p-10">Loading simulation data...</div>;
+    // --- (Prepare Data Safely) ---
+    const timeSeriesData = (parsedResults?.time_series_data || []).map(d => ({
+        time: d.time_s ?? 0,
+        maxStress: d.max_stress_MPa ?? 0,
+        avgTemp: d.avg_temperature_C ?? 0,
+        maxTemp: d.max_temperature_C ?? (d.avg_temperature_C ?? 0),
+        totalWear: d.total_accumulated_wear_m ?? 0
+    }));
+
+    let keyMetrics = {
+        max_stress_MPa: 'N/A',
+        max_temperature_C: 'N/A',
+        total_accumulated_wear_m: 'N/A',
+        predicted_tool_life_hrs: 'N/A'
+    };
+
+    if (simulation?.status === 'COMPLETED' && parsedResults) {
+        if (timeSeriesData.length > 0) {
+            const maxStresses = timeSeriesData.map(d => d.maxStress);
+            keyMetrics.max_stress_MPa = Math.max(...maxStresses) || 0;
+
+            const maxTemps = timeSeriesData.map(d => d.maxTemp);
+            keyMetrics.max_temperature_C = Math.max(...maxTemps) || 0;
+
+            keyMetrics.total_accumulated_wear_m = timeSeriesData[timeSeriesData.length - 1]?.totalWear || 0;
+        }
+
+        keyMetrics.predicted_tool_life_hrs = parsedResults?.tool_life_prediction?.predicted_hours ?? 'N/A';
     }
-    if (!simulation) {
-         return <div className="text-center text-gray-300 p-10">Loading...</div>;
-    }
-    if (simulation.status === 'PENDING' || simulation.status === 'RUNNING') {
+
+    // --- Render States ---
+
+    if (isLoading) {
         return (
-            <div className="p-6 text-white">
-                <h1 className="text-3xl font-bold mb-4">Simulation: {simulation.name}</h1>
-                <div className="bg-gray-800 p-8 rounded-lg text-center">
-                    <div className="text-2xl font-semibold mb-4">Simulation is: {simulation.status}</div>
-                    <div className="text-gray-400">Please wait. This page will automatically refresh...</div>
-                    <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-400 mx-auto mt-6"></div>
-                </div>
+            <div className="flex flex-col items-center justify-center h-64 text-gray-400">
+                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-500 mb-4"></div>
+                <p>Loading simulation data...</p>
             </div>
         );
     }
-    if (simulation.status === 'FAILED') {
-        return (
-            <div className="p-6 text-white">
-                <h1 className="text-3xl font-bold mb-4">Simulation: {simulation.name}</h1>
-                <div className="bg-gray-800 p-8 rounded-lg">
-                    <div className="text-2xl font-semibold mb-4 text-red-500">Simulation FAILED</div>
-                    <div className="text-gray-300 mb-2">The simulation engine reported an error.</div>
-                    {parsedResults && parsedResults.error ? (
-                        <pre className="bg-gray-900 p-4 rounded-md text-red-300 overflow-auto">
-                            <div className="font-bold">Error: {parsedResults.error}</div>
-                            {parsedResults.stderr && <div className="mt-2">Details: {parsedResults.stderr}</div>}
-                        </pre>
-                    ) : (
-                         <pre className="bg-gray-900 p-4 rounded-md text-red-300 overflow-auto">
-                            {simulation.results || "No error details were provided by the worker."}
-                         </pre>
-                    )}
-                </div>
-            </div>
-        );
-    }
+
     if (error) {
         return (
-             <div className="p-6 text-white">
-                <h1 className="text-3xl font-bold mb-4">Error Loading Results</h1>
-                <div className="bg-gray-800 p-8 rounded-lg">
-                    <div className="text-2xl font-semibold mb-4 text-red-500">Could not display results</div>
-                    <div className="text-gray-300 mb-2">The simulation completed, but the results could not be parsed.</div>
-                    <pre className="bg-gray-900 p-4 rounded-md text-red-300 overflow-auto">
-                        {error}
-                    </pre>
+            <div className="p-6 text-white">
+                <div className="bg-red-900/30 border border-red-500 p-6 rounded-lg">
+                    <h2 className="text-2xl font-bold text-red-400 mb-2">Error Loading Simulation</h2>
+                    <p className="text-gray-300">{error}</p>
+                    <Link to="/simulations" className="text-indigo-400 hover:text-indigo-300 mt-4 inline-block">
+                        &larr; Return to Simulations
+                    </Link>
                 </div>
             </div>
         );
     }
-    if (simulation.status === 'COMPLETED' && !parsedResults) {
+
+    if (simulation?.status === 'FAILED') {
         return (
             <div className="p-6 text-white">
-                <h1 className="text-3xl font-bold mb-4">Error Loading Results</h1>
-                <div className="bg-gray-800 p-8 rounded-lg">
-                    <div className="text-2xl font-semibold mb-4 text-red-500">Parsing Error</div>
-                    <div className="text-gray-300 mb-2">Simulation completed but results are missing or could not be parsed.</div>
+                <div className="flex justify-between items-center mb-6">
+                    <h1 className="text-3xl font-bold">{simulation.name}</h1>
+                    <span className="px-4 py-2 rounded-full bg-red-500/20 text-red-300 font-bold border border-red-500">
+                        FAILED
+                    </span>
+                </div>
+                <div className="bg-gray-800 p-6 rounded-lg border border-red-500/50">
+                    <h3 className="text-xl font-semibold mb-4">Failure Details</h3>
+                    <div className="bg-gray-950 p-4 rounded font-mono text-sm text-red-300 overflow-auto max-h-[500px]">
+                        {parsedResults?.error || parsedResults?.stderr || simulation.results || "Unknown error occurred during execution."}
+                    </div>
                 </div>
             </div>
         );
     }
-    
-    // --- (Prepare Data - ALL BUGS FIXED) ---
-    
-    // 1. Get Time Series Data
-    const timeSeriesData = parsedResults?.time_series_data?.map(d => ({
-        time: d.time_s,
-        maxStress: d.max_stress_MPa,
-        avgTemp: d.avg_temperature_C, 
-        maxTemp: d.max_temperature_C, // <-- Get max_temperature_C
-        totalWear: d.total_accumulated_wear_m
-    })) || [];
-    
-    // 2. Create the keyMetrics object
-    let keyMetrics = {};
-    if (timeSeriesData.length > 0) {
-        const lastStep = timeSeriesData[timeSeriesData.length - 1];
-        
-        // Filter out null/undefined/NaN values before finding max
-        const maxStresses = timeSeriesData.map(d => d.maxStress).filter(t => t != null && !isNaN(t));
-        keyMetrics.max_stress_MPa = maxStresses.length > 0 ? Math.max(...maxStresses) : null;
-        
-        // --- THIS IS THE MAX TEMP FIX ---
-        // Your console log showed `max_temperature_C` is not always present,
-        // so we will find the max of the `avg_temperature_C` instead.
-        const maxTemps = timeSeriesData.map(d => d.avgTemp).filter(t => t != null && !isNaN(t));
-        keyMetrics.max_temperature_C = maxTemps.length > 0 ? Math.max(...maxTemps) : null;
-        // --- END MAX TEMP FIX ---
-        
-        keyMetrics.total_accumulated_wear_m = lastStep.totalWear;
-    }
-    
-    // 3. Get Tool Life
-    if (parsedResults?.tool_life_prediction) {
-        keyMetrics.predicted_tool_life_hrs = parsedResults.tool_life_prediction.predicted_hours;
-    }
-    
-    // 4. Get 3D data
-    const vertexData = parsedResults?.final_node_states || null;
-    
-    // --- END DATA PREP ---
 
+    if (simulation?.status === 'PENDING' || simulation?.status === 'RUNNING') {
+        return (
+            <div className="p-6 text-white max-w-4xl mx-auto mt-10">
+                <div className="bg-gray-800 p-10 rounded-xl shadow-2xl text-center border border-indigo-500/30">
+                    <h1 className="text-3xl font-bold mb-6">{simulation.name}</h1>
+                    
+                    <div className="relative mx-auto w-32 h-32 mb-8">
+                        <div className="absolute inset-0 rounded-full border-4 border-gray-700"></div>
+                        <div className="absolute inset-0 rounded-full border-t-4 border-indigo-500 animate-spin"></div>
+                        <div className="absolute inset-0 flex items-center justify-center font-bold text-lg tracking-wider">
+                            {simulation.status}
+                        </div>
+                    </div>
+
+                    <p className="text-gray-400 text-lg animate-pulse">
+                        {simulation.status === 'PENDING' 
+                            ? "Queued for execution..." 
+                            : "Physics engine is running..."}
+                    </p>
+                    <p className="text-sm text-gray-500 mt-4">
+                        This page will automatically refresh when results are ready.
+                    </p>
+                </div>
+            </div>
+        );
+    }
+
+    // --- COMPLETED STATE (Main Render) ---
+
+    // 4. Get 3D Tool Data
+    const vertexData = parsedResults?.final_node_states || null;
+
+    // 5. Get 3D CFD Particle Data
+    const particleFrames = parsedResults?.cfd_particle_animation || [];
+    const lastFrame = particleFrames.length > 0 ? particleFrames[particleFrames.length - 1] : null;
+    const particleData = lastFrame?.particles || null;
 
     return (
         <div className="p-6 text-white">
-            {/* --- (Header and Buttons) --- */}
-            <div className="flex justify-between items-center mb-6">
-                <Link to="/simulations" className="flex items-center text-indigo-400 hover:text-indigo-300">
-                    <span className="mr-2">&larr;</span> 
-                    Back to Simulations
-                </Link>
-                <button
-                    onClick={handleDownloadPdf}
-                    disabled={isLoading}
-                    className="flex items-center bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded-lg disabled:bg-gray-500"
-                >
-                    {isLoading ? 'Generating PDF...' : 'Download PDF Report'}
-                </button>
+            {/* Header */}
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 gap-4">
+                <div>
+                    <div className="flex items-center gap-4 mb-2">
+                        <h1 className="text-3xl font-bold">{simulation.name}</h1>
+                        <span className="px-3 py-1 rounded-full bg-green-500/20 text-green-300 text-sm font-bold border border-green-500">
+                            COMPLETED
+                        </span>
+                    </div>
+                    <p className="text-gray-400 max-w-2xl">{simulation.description}</p>
+                </div>
+                <div className="flex gap-4">
+                    <Link 
+                        to="/simulations" 
+                        className="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium transition-colors"
+                    >
+                        Back to List
+                    </Link>
+                    <button
+                        onClick={handleDownloadPdf}
+                        disabled={isGeneratingPdf}
+                        className={`px-6 py-2 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-bold transition-colors flex items-center gap-2 ${isGeneratingPdf ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    >
+                        {isGeneratingPdf ? (
+                            <><span className="animate-spin h-4 w-4 border-2 border-white border-t-transparent rounded-full"></span> Generating...</>
+                        ) : (
+                            <>Download PDF Report</>
+                        )}
+                    </button>
+                </div>
             </div>
 
-            {/* --- (Main Report Content - This div is targeted by html2canvas) --- */}
-            <div id="report-content" className="bg-gray-900 p-4 md:p-8 rounded-lg">
+            {/* Report Content Container */}
+            <div id="report-content" className="space-y-8">
                 
-                <h1 className="text-3xl font-bold mb-2">Simulation Report: {simulation.name}</h1>
-                <p className="text-gray-400 mb-6">{simulation.description}</p>
-
-                {/* --- Row 1: Key Metrics --- */}
-                <h2 className="text-2xl font-semibold mb-4 text-indigo-300">Key Metrics</h2>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-                    <MetricCard 
-                        title="Max Stress" 
-                        value={keyMetrics.max_stress_MPa?.toFixed(2) || 'N/A'} 
-                        unit="MPa" 
+                {/* Key Metrics Grid */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <MetricCard
+                        title="Max Von Mises Stress"
+                        value={typeof keyMetrics.max_stress_MPa === 'number' ? keyMetrics.max_stress_MPa.toFixed(1) : 'N/A'}
+                        unit="MPa"
+                        icon="⚡"
+                        color="blue"
                     />
-                    <MetricCard 
-                        title="Max Tool Temp" 
-                        value={keyMetrics.max_temperature_C?.toFixed(2) || 'N/A'} 
-                        unit="°C" 
+                    <MetricCard
+                        title="Peak Tool Temperature"
+                        value={typeof keyMetrics.max_temperature_C === 'number' ? keyMetrics.max_temperature_C.toFixed(1) : 'N/A'}
+                        unit="°C"
+                        icon="🔥"
+                        color="orange"
                     />
-                    <MetricCard 
-                        title="Predicted Tool Life" 
-                        value={keyMetrics.predicted_tool_life_hrs || 'N/A'} 
-                        unit="hours" 
+                    <MetricCard
+                        title="Predicted Tool Life"
+                        value={typeof keyMetrics.predicted_tool_life_hrs === 'number' ? keyMetrics.predicted_tool_life_hrs.toFixed(1) : 'N/A'}
+                        unit="hours"
+                        icon="⏳"
+                        color="green"
                     />
-                    <MetricCard 
-                        title="Total Wear" 
-                        value={keyMetrics.total_accumulated_wear_m?.toExponential(2) || 'N/A'} 
-                        unit="m" 
+                    <MetricCard
+                        title="Total Flank Wear"
+                        value={typeof keyMetrics.total_accumulated_wear_m === 'number' ? (keyMetrics.total_accumulated_wear_m * 1000).toFixed(3) : 'N/A'}
+                        unit="mm"
+                        icon="📉"
+                        color="red"
                     />
                 </div>
-                
-                {/* --- Row 2: 3D VISUAL & ANALYSIS (Side-by-Side) --- */}
-                <h2 className="text-2xl font-semibold mb-4 text-indigo-300">Analysis & 3D Snapshot</h2>
-                {/* --- LAYOUT FIX: Changed grid-cols-3, col-span-2, col-span-1 --- */}
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
-                    
-                    {/* --- 3D Visual Column (Larger) --- */}
-                    <div className="lg:col-span-2 bg-gray-800 p-4 rounded-lg h-[500px]">
-                        <h3 className="text-xl font-semibold mb-2">3D Stress Snapshot (Point Cloud)</h3>
-                        {simulation.tool_id && vertexData ? (
-                             <ResultThreeDeeSnapshot 
-                                nodeData={vertexData} 
-                            />
-                        ) : (
-                            <div className="text-gray-400">3D vertex data (final_node_states) was not found in results.</div>
-                        )}
+
+                {/* Main Analysis Section */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* 3D Viewer - Takes 2/3 width on large screens */}
+                    <div className="lg:col-span-2 bg-gray-800 rounded-xl overflow-hidden shadow-xl border border-gray-700 flex flex-col h-[600px]">
+                        <div className="p-4 bg-gray-800 border-b border-gray-700 flex justify-between items-center">
+                            <h3 className="font-bold text-lg">3D Stress Analysis State (Final Step)</h3>
+                            <span className="text-xs text-gray-400 px-2 py-1 bg-gray-900 rounded">
+                                {parsedResults?.final_node_states?.length || 0} nodes
+                            </span>
+                        </div>
+                        <div className="flex-grow relative h-full w-full min-h-[500px]">
+                            {(vertexData || particleData) ? (
+                                <ResultThreeDeeSnapshot 
+                                    nodeData={vertexData} 
+                                    particleData={particleData} 
+                                />
+                            ) : (
+                                <div className="absolute inset-0 flex items-center justify-center text-gray-500 bg-gray-900/50">
+                                    <div className="text-center">
+                                        <p className="text-xl mb-2">No 3D Data Available</p>
+                                        <p className="text-sm">The simulation did not return any node state data.</p>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
                     </div>
-                    
-                    {/* --- Analysis Report Column (Smaller) --- */}
-                    <div className="lg:col-span-1 bg-gray-800 p-6 rounded-lg h-[500px] overflow-y-auto">
-                         <h3 className="text-xl font-semibold mb-2">Analysis & Recommendations</h3>
-                        <AnalysisReport 
-                            summaryMetrics={keyMetrics} 
-                            materialProperties={JSON.parse(simulation.material_properties || '{}')} 
+
+                    {/* Text Analysis Report - Takes 1/3 width */}
+                    <div className="lg:col-span-1 bg-gray-800 p-6 rounded-xl shadow-xl border border-gray-700 h-[600px] overflow-y-auto custom-scrollbar">
+                        <h3 className="font-bold text-xl mb-4 text-indigo-300">Engineering Report</h3>
+                        <AnalysisReport
+                            summaryMetrics={keyMetrics}
+                            materialProperties={typeof simulation.material_properties === 'string' 
+                                ? JSON.parse(simulation.material_properties) 
+                                : simulation.material_properties}
                         />
                     </div>
                 </div>
 
-                {/* --- Row 3: Charts (Stacked Vertically) --- */}
-                <h2 className="text-2xl font-semibold mb-4 text-indigo-300">Time-Series Analysis</h2>
-                <div className="grid grid-cols-1 gap-6 mb-6"> 
-                    
-                    {/* --- Chart 1: Stress & Temp vs. Time --- */}
-                    <div className="bg-gray-800 p-4 rounded-lg h-[400px]">
-                        <h3 className="text-xl font-semibold mb-4 text-center">Stress & Temperature vs. Time</h3>
-                        <ResponsiveContainer width="100%" height="90%">
-                            <LineChart data={timeSeriesData}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#4a5568" />
-                                <XAxis dataKey="time" stroke="#9f7aea" label={{ value: 'Time (s)', position: 'insideBottom', offset: -10, fill: '#e2e8f0' }} />
-                                <YAxis yAxisId="left" stroke="#63b3ed" label={{ value: 'Stress (MPa)', angle: -90, position: 'insideLeft', fill: '#63b3ed' }} />
-                                <YAxis yAxisId="right" orientation="right" stroke="#f6ad55" label={{ value: 'Temp (°C)', angle: 90, position: 'insideRight', fill: '#f6ad55' }} />
-                                <Tooltip contentStyle={{ backgroundColor: '#2d3748', border: 'none' }} />
-                                <Legend />
-                                <Line yAxisId="left" type="monotone" dataKey="maxStress" stroke="#63b3ed" name="Max Stress" dot={false} />
-                                <Line yAxisId="right" type="monotone" dataKey="avgTemp" stroke="#f6ad55" name="Avg. Temp" dot={false} />
-                            </LineChart>
-                        </ResponsiveContainer>
+                {/* Charts Section - Stacked vertically */}
+                <div className="grid grid-cols-1 gap-8">
+                    {/* Chart 1 */}
+                    <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-xl">
+                        <h3 className="font-bold text-lg mb-6 text-center">Thermo-Mechanical History</h3>
+                        <div className="h-[500px]">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={timeSeriesData} margin={{ top: 5, right: 30, left: 20, bottom: 25 }}>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                    <XAxis 
+                                        dataKey="time" 
+                                        stroke="#9ca3af" 
+                                        label={{ value: 'Time (seconds)', position: 'insideBottom', offset: -20, fill: '#9ca3af' }} 
+                                    />
+                                    <YAxis 
+                                        yAxisId="left" 
+                                        stroke="#60a5fa" 
+                                        label={{ value: 'Stress (MPa)', angle: -90, position: 'insideLeft', fill: '#60a5fa' }} 
+                                    />
+                                    <YAxis 
+                                        yAxisId="right" 
+                                        orientation="right" 
+                                        stroke="#f97316" 
+                                        label={{ value: 'Temperature (°C)', angle: 90, position: 'insideRight', fill: '#f97316' }} 
+                                    />
+                                    <Tooltip 
+                                        contentStyle={{ backgroundColor: '#1f2937', borderColor: '#374151', color: '#f3f4f6' }}
+                                        itemStyle={{ color: '#e5e7eb' }}
+                                        labelStyle={{ color: '#9ca3af' }}
+                                    />
+                                    <Legend verticalAlign="top" height={36}/>
+                                    <Line yAxisId="left" type="monotone" dataKey="maxStress" stroke="#60a5fa" name="Max Stress (MPa)" dot={false} strokeWidth={2} />
+                                    <Line yAxisId="right" type="monotone" dataKey="maxTemp" stroke="#f97316" name="Max Temp (°C)" dot={false} strokeWidth={2} />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        </div>
                     </div>
-                    
-                    {/* --- Chart 2: NEW Wear vs. Time --- */}
-                    <div className="bg-gray-800 p-4 rounded-lg h-[400px]">
-                        <h3 className="text-xl font-semibold mb-4 text-center">Total Wear vs. Time</h3>
-                        <ResponsiveContainer width="100%" height="90%">
-                            <LineChart data={timeSeriesData}>
-                                <CartesianGrid strokeDasharray="3 3" stroke="#4a5568" />
-                                <XAxis dataKey="time" stroke="#9f7aea" label={{ value: 'Time (s)', position: 'insideBottom', offset: -10, fill: '#e2e8f0' }} />
-                                <YAxis stroke="#48bb78" label={{ value: 'Wear (m)', angle: -90, position: 'insideLeft', fill: '#48bb78' }} />
-                                <Tooltip contentStyle={{ backgroundColor: '#2d3748', border: 'none' }} />
-                                <Legend />
-                                <Line type="monotone" dataKey="totalWear" stroke="#48bb78" name="Total Wear" dot={false} />
-                            </LineChart>
-                        </ResponsiveContainer>
+
+                    {/* Chart 2 */}
+                    <div className="bg-gray-800 p-6 rounded-xl border border-gray-700 shadow-xl">
+                        <h3 className="font-bold text-lg mb-6 text-center">Progressive Tool Wear</h3>
+                        <div className="h-[500px]">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={timeSeriesData} margin={{ top: 5, right: 30, left: 30, bottom: 25 }}>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                                    <XAxis 
+                                        dataKey="time" 
+                                        stroke="#9ca3af" 
+                                        label={{ value: 'Time (seconds)', position: 'insideBottom', offset: -20, fill: '#9ca3af' }} 
+                                    />
+                                    <YAxis 
+                                        stroke="#34d399" 
+                                        label={{ value: 'Accumulated Wear (m)', angle: -90, position: 'insideLeft', offset: 10, fill: '#34d399' }} 
+                                        tickFormatter={(value) => value.toExponential(1)} 
+                                    />
+                                    <Tooltip 
+                                        contentStyle={{ backgroundColor: '#1f2937', borderColor: '#374151', color: '#f3f4f6' }}
+                                        formatter={(value) => [value.toExponential(4) + ' m', 'Total Wear']}
+                                    />
+                                    <Legend verticalAlign="top" height={36}/>
+                                    <Line type="monotone" dataKey="totalWear" stroke="#34d399" name="Cumulative Wear (meters)" dot={false} strokeWidth={2} />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        </div>
                     </div>
                 </div>
-
-            </div> {/* End of #report-content */}
+            </div>
         </div>
     );
 };
